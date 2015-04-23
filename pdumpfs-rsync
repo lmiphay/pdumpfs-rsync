@@ -1,0 +1,153 @@
+#!/usr/bin/ruby
+#
+# pdumpfs-rsync: remote pdumpfs using rsync
+#
+# Usage:
+#   pdumpfs-rsync <username>@<source host>:<source directory> \
+#                 <destination directory>
+#
+# Copyright(C) 2003 Taku YASUI <tach@debian.or.jp>, All rights reserved.
+# This software uses codes from pdumpfs.  pdumpfs is copyrighted by
+# Satoru Takabayashi <satoru@namazu.org>.
+# This is free software with ABSOLUTELY NO WARRANTY.
+#
+# You can redistribute it and/or modify it under the terms of 
+# the GNU General Public License version 2.
+#
+
+load '/usr/bin/pdumpfs'
+require 'ftools'
+require 'getoptlong'
+
+PDUMPFS_RSYNC_VERSION  = '0.8.1'
+
+def parse_options
+  patterns = []
+  globs = []
+  size = nil
+  rsync_options = []
+  options = {}
+  ret = []
+  base = nil
+
+  parser = GetoptLong.new
+  parser.set_options(
+    ['--exclude',			GetoptLong::REQUIRED_ARGUMENT],
+    ['--exclude-from',			GetoptLong::REQUIRED_ARGUMENT],
+    ['--include',			GetoptLong::REQUIRED_ARGUMENT],
+    ['--include-from',			GetoptLong::REQUIRED_ARGUMENT],
+    ['--exclude-by-regexp', '-e',	GetoptLong::REQUIRED_ARGUMENT],
+    ['--exclude-by-size', '-s',		GetoptLong::REQUIRED_ARGUMENT],
+    ['--exclude-by-glob', '-w',		GetoptLong::REQUIRED_ARGUMENT],
+    ['--base',				GetoptLong::REQUIRED_ARGUMENT],
+    ['--force-hardlink', '-f',		GetoptLong::NO_ARGUMENT],
+    ['--help', '-h',			GetoptLong::NO_ARGUMENT],
+    ['--version', '-v',			GetoptLong::NO_ARGUMENT])
+  parser.each_option do |name, arg|
+    case name
+    when /^--(in|ex)clude(-from)?$/
+      rsync_options.push(sprintf("%s=%s", name, arg))
+    when '--exclude-by-regexp'
+      patterns.push(Regexp.new(arg))
+    when '--exclude-by-size'
+      size = arg
+    when '--exclude-by-glob'
+      globs.push(arg)
+    when '--help'
+      usage
+    when '--version'
+      version
+    when '--base'
+      base = arg
+    else
+      options[name.sub(/^--/, "")] = arg
+    end
+  end
+  matcher = Pdumpfs::FileMatcher.new(:size	=> size,
+				     :globs	=> globs,
+				     :patterns	=> patterns)
+
+  usage if ( ARGV.length < 2 )
+
+  # strip the trailing / to avoid basename(src) == ''.
+  src  = ARGV[0].sub(%r!/+$!, "")
+  dest = ARGV[1]
+  base = ARGV[2] || base || File.basename(ARGV[0].sub(%r!^[^/]+?:!, '').sub(%r!/+$!, ''))
+
+  nodir(dest) if File.directory?(dest) == false
+  if windows?
+    dest = expand_special_folders(dest)
+  end
+
+  ret.push(File.join(ARGV[1], 'latest', base))
+  ret.push(dest)
+  ret.push(base)
+  ret.push(matcher)
+  ret.push(rsync_options)
+  ret.push(options)
+end
+
+def usage
+  puts "Usage: pdumpfs <source directory> <destination directory>" +
+       " [destination basename]"
+  puts "  -e, --exclude-by-regexp=PATTERN  exclude files/directories matching PATTERN"
+  puts "  -s, --exclude-by-size=SIZE       exclude files larger than SIZE"
+  puts "  -w, --exclude-by-glob=GLOB       exclude files matching GLOB"
+  puts "      --exclude=PATTERN            exclude files matching PATTERN (rsync)"
+  puts "      --include=PATTERN            include files matching PATTERN (rsync)"
+  puts "      --exclude-from=FILE          exclude patterns listed in FILE (rsync)"
+  puts "      --include-from=FILE          include patterns listed in FILE (rsync)"
+  puts "  -f, --force-hardlink             Force hardlinking when rsync is failed"
+  puts "  -v, --version                    print version information and exit"
+  puts "  -h, --help                       show this help message"
+  exit 0
+end
+
+def version
+  puts 'pdumpfs-rsync ' + PDUMPFS_RSYNC_VERSION
+  exit 0
+end
+
+def main
+  src, dest, base, matcher, rsync_opts, opts = parse_options
+  rsync_array = ['/usr/bin/rsync',
+		 '-avH',
+		 '--delete',
+		 '--delete-excluded',
+		 '--size-only',
+		 '--exclude=lost+found/',
+		 '--rsh=/usr/bin/ssh']
+
+  if windows?
+    fstype = get_filesystem_type(dest)
+
+    if fstype !~ /ntfs/i
+      STDERR.fprintf("pdumpfs: only NTFS is supported but %s is %s.",
+		     dest, fstype)
+      exit 1
+    end
+  end
+
+  start_time = Time.now
+  pdumpfs = Pdumpfs::Pdumpfs.new(opts)
+  latest = pdumpfs.latest_snapshot(start_time, src, dest, base)
+  today = File.join(dest, pdumpfs.datedir(Date.today), base)
+  rsync_array = rsync_array + rsync_opts
+  rsync_array.push(ARGV[0].sub(%r!/+$!, '') + '/')
+  rsync_array.push(src + '/')
+
+  File.umask(0077)
+  File.mkpath(src)
+  File.mkpath(today)
+  if ( system(*rsync_array) || opts['force-hardlink'] )
+    if ( $? >> 8 != 0 )
+      STDERR.print "WARNING: rsync failed: #{ARGV[0]}; exit value: #{$? >> 8}\n"
+    end
+    pdumpfs.update_snapshot(src, latest, today)
+  else
+    STDERR.print "rsync failed: #{ARGV[0]}; exit value: #{$? >> 8}\n"
+    exit $? >> 8
+  end
+end
+
+main if __FILE__ == $0
